@@ -4,6 +4,7 @@ import os
 import json
 import sys
 from pathlib import Path
+import matplotlib.pyplot as plt
 
 # Add project root to Python path for imports
 current_dir = Path(__file__).parent
@@ -17,8 +18,10 @@ from utils.cache import init_cache, get_cached_result, cache_result
 from utils.helpers import extract_first_code_block
 
 # Import Agents
-from agents.code_generation import CodeGenerationAgent, ExecutionAgent, ReasoningAgent
-from agents.data_insights import CombinedAnalysisAgent, MissingValueAgent, DataInsightAgent
+import agents.code_generation as code_gen
+CodeGenerationAgent = code_gen.CodeGenerationAgent
+ExecutionAgent = code_gen.ExecutionAgent
+ReasoningAgent = code_gen.ReasoningAgent
 
 # Import Tools
 from tools.query_understanding import QueryUnderstandingTool
@@ -86,106 +89,95 @@ def main():
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
                     # Step 1: Understand the query intent
-                    intent_result = QueryUnderstandingTool(st.session_state.df, user_query)
+                    intent_result = QueryUnderstandingTool(user_query)
                     intent = intent_result.get("intent", "unknown")
+                    is_chartjs = intent_result.get("is_chartjs", False)
                     
                     assistant_response = ""
                     
                     if intent_result.get("needs_clarification"):
                         assistant_response = intent_result.get("clarification_question", "I'm not sure how to proceed. Could you clarify?")
                     
-                    elif intent == "preprocess":
+                    elif intent == "preprocessing":
                         # Handle preprocessing requests
                         try:
-                            preprocess_params = intent_result.get("preprocess_params", {})
-                            df_processed = PreprocessingTool(st.session_state.df, **preprocess_params)
-                            
-                            if not st.session_state.df.equals(df_processed):
-                                st.session_state.df = df_processed
-                                assistant_response = "Preprocessing applied successfully. The DataFrame has been updated."
-                                st.success("DataFrame updated!")
+                            code, params = PreprocessingCodeGeneratorTool(st.session_state.df.columns.tolist(), user_query)
+                            if code:
+                                result = ExecutionAgent(code, st.session_state.df, intent, is_chartjs, user_query)
+                                if isinstance(result, pd.DataFrame):
+                                    st.session_state.df = result
+                                    assistant_response = "Preprocessing applied successfully. The DataFrame has been updated."
+                                    st.success("DataFrame updated!")
+                                    st.dataframe(result.head())
+                                else:
+                                    assistant_response = str(result)
                             else:
-                                assistant_response = "Preprocessing was applied, but no changes were detected in the DataFrame."
+                                assistant_response = "Could not generate preprocessing code. Please try rephrasing your request."
                         except Exception as e:
                             assistant_response = f"Error during preprocessing: {str(e)}"
                     
-                    elif intent == "visualize":
+                    elif intent == "visualization":
                         # Handle visualization requests
-                        chart_type = intent_result.get("chart_type", "")
-                        plot_desc = intent_result.get("plot_description", user_query)
-                        
-                        if "chartjs" in chart_type.lower():
-                            # Generate Chart.js config
-                            try:
-                                config = ChartJSCodeGeneratorTool(st.session_state.df, plot_desc, chart_type)
-                                assistant_response = f"Generated Chart.js configuration for: {plot_desc}"
-                                st.json(config)
-                            except Exception as e:
-                                assistant_response = f"Error generating Chart.js visualization: {str(e)}"
-                        else:
-                            # Generate matplotlib plot
-                            try:
-                                viz_code = PlotCodeGeneratorTool(st.session_state.df, plot_desc, chart_type)
-                                plot_result = ExecutionAgent(viz_code, st.session_state.df, user_query)
-                                
-                                if isinstance(plot_result, str) and "Error" in plot_result:
-                                    assistant_response = plot_result
-                                else:
-                                    assistant_response = f"Generated plot for: {plot_desc}"
-                                    if hasattr(plot_result, 'getvalue'):  # BytesIO object
-                                        st.image(plot_result.getvalue())
-                                    else:
-                                        st.pyplot(plot_result)
-                            except Exception as e:
-                                assistant_response = f"Error generating visualization: {str(e)}"
-                    
-                    elif intent == "analyze":
-                        # Handle analysis requests
-                        analysis_type = intent_result.get("analysis_type", "general")
-                        
-                        if analysis_type == "missing_values":
-                            try:
-                                missing_info = MissingValueAgent(st.session_state.df)
-                                assistant_response = missing_info.get("summary", "Could not retrieve missing value summary.")
-                                
-                                if missing_info.get("dataframe"):
-                                    st.dataframe(pd.DataFrame(missing_info["dataframe"]))
-                            except Exception as e:
-                                assistant_response = f"Error analyzing missing values: {str(e)}"
-                        else:
-                            # Generic analysis
-                            try:
-                                analysis_code = CodeWritingTool(st.session_state.df.columns.tolist(), user_query, intent="analyze")
-                                analysis_result = ExecutionAgent(analysis_code, st.session_state.df, user_query)
-                                
-                                if isinstance(analysis_result, str) and "Error" in analysis_result:
-                                    assistant_response = analysis_result
-                                elif isinstance(analysis_result, (pd.DataFrame, pd.Series)):
-                                    assistant_response = "Analysis complete. Results:"
-                                    st.dataframe(analysis_result)
-                                else:
-                                    assistant_response = f"Analysis result: {str(analysis_result)}"
-                            except Exception as e:
-                                assistant_response = f"Error during analysis: {str(e)}"
-                    
-                    elif intent == "model":
-                        # Handle model recommendation requests
                         try:
-                            target_var = intent_result.get("model_params", {}).get("target_variable")
-                            recommendations = ModelRecommendationTool(st.session_state.df, user_query, target_var)
-                            
-                            if isinstance(recommendations, list):
-                                assistant_response = "**Suggested Models:**\n"
-                                for rec in recommendations:
-                                    assistant_response += f"- **{rec.get('model_name', 'N/A')}**: {rec.get('description', 'N/A')} (Use case: {rec.get('use_case', 'N/A')})\n"
+                            if is_chartjs:
+                                # Generate Chart.js config using prompt
+                                prompt = ChartJSCodeGeneratorTool(st.session_state.df.columns.tolist(), user_query)
+                                code, _, _, result = CodeGenerationAgent(user_query, st.session_state.df)
+                                if code:
+                                    result = ExecutionAgent(code, st.session_state.df, intent, is_chartjs, user_query)
+                                    if isinstance(result, dict):
+                                        assistant_response = "Generated Chart.js configuration:"
+                                        st.json(result)
+                                    else:
+                                        assistant_response = str(result)
                             else:
-                                assistant_response = recommendations
+                                # Generate matplotlib plot using prompt
+                                prompt = PlotCodeGeneratorTool(st.session_state.df.columns.tolist(), user_query)
+                                code, _, _, result = CodeGenerationAgent(user_query, st.session_state.df)
+                                if code:
+                                    result = ExecutionAgent(code, st.session_state.df, intent, is_chartjs, user_query)
+                                    if isinstance(result, (plt.Figure, plt.Axes)):
+                                        assistant_response = "Generated visualization:"
+                                        st.pyplot(result)
+                                    else:
+                                        assistant_response = str(result)
                         except Exception as e:
-                            assistant_response = f"Error generating model recommendations: {str(e)}"
+                            assistant_response = f"Error generating visualization: {str(e)}"
+                    
+                    elif intent == "analytics":
+                        # Handle analysis requests
+                        try:
+                            code, _, _, result = CodeGenerationAgent(user_query, st.session_state.df)
+                            if code:
+                                result = ExecutionAgent(code, st.session_state.df, intent, is_chartjs, user_query)
+                                if isinstance(result, str) and "Error" in result:
+                                    assistant_response = result
+                                elif isinstance(result, (pd.DataFrame, pd.Series)):
+                                    assistant_response = "Analysis complete. Results:"
+                                    st.dataframe(result)
+                                else:
+                                    assistant_response = f"Analysis result: {str(result)}"
+                            else:
+                                # Try DataInsightAgent for general insights
+                                if "insights" in user_query.lower() or "describe" in user_query.lower():
+                                    assistant_response = DataInsightAgent(st.session_state.df)
+                                else:
+                                    assistant_response = "Could not generate analysis code. Please try rephrasing your request."
+                        except Exception as e:
+                            assistant_response = f"Error during analysis: {str(e)}"
                     
                     else:
                         # Unknown or clarification needed
                         assistant_response = "I'm not sure how to help with that. Could you try rephrasing your question or be more specific?"
+                    
+                    # Get reasoning about the result if we have one
+                    if assistant_response and not intent_result.get("needs_clarification"):
+                        try:
+                            _, reasoning = ReasoningAgent(user_query, result if 'result' in locals() else assistant_response)
+                            if reasoning:
+                                assistant_response = f"{assistant_response}\n\n**Analysis**: {reasoning}"
+                        except Exception as e:
+                            print(f"Error getting reasoning: {e}")  # Log but don't affect response
                     
                     # Display assistant response
                     st.markdown(assistant_response)
